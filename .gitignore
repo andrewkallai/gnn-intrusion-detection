@@ -209,3 +209,28 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# OS/editor files
+.DS_Store
+Thumbs.db
+.matplotlib-cache/
+
+# Large generated data/artifacts
+data/raw/
+data/processed/
+data/processed_10min/
+data/graph_10min_moduleA/
+data/graph_10min_moduleA_stratified/
+data/graph_unsw_10min/
+data/graph_unsw_full_10min/
+data/graph_unsw_full_10min_stratified/
+data/graph_unsw_full_10min_stratified_clean/
+Module_A/
+Module_A 2/
+*.zip
+
+# Local reports/PDFs
+*.pdf
+
+# Local datasets
+CTU-IoT-Malware-Capture.labeled.csv
