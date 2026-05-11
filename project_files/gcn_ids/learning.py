@@ -4,42 +4,35 @@ import os.path as osp
 import time
 from pathlib import Path
 
-import cupy
 import numpy as np
 import psutil
-import rmm
 import torch
 import torch.distributed as dist
 import torch_geometric
-from rmm.allocators.cupy import rmm_cupy_allocator
-from rmm.allocators.torch import rmm_torch_allocator
 from torch_geometric.data import Data
 from torch_geometric.loader import NeighborLoader as PyGNeighborLoader
 
-# Must change allocators immediately upon import
-# or else other imports will cause memory to be
-# allocated and prevent changing the allocator
-# rmm.reinitialize() provides an easy way to initialize RMM
-# with specific memory resource options across multiple devices.
-# See help(rmm.reinitialize) for full details.
-rmm.reinitialize(devices=[0], pool_allocator=True, managed_memory=True)
-cupy.cuda.set_allocator(rmm_cupy_allocator)
-#torch.cuda.memory.change_current_allocator(rmm_torch_allocator)
+DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-import cudf  # noqa
-import cugraph_pyg  # noqa
+if torch.cuda.is_available():
+    import cupy
+    import rmm
+    from rmm.allocators.cupy import rmm_cupy_allocator
+    from rmm.allocators.torch import rmm_torch_allocator
+    rmm.reinitialize(devices=[0], pool_allocator=True, managed_memory=True)
+    cupy.cuda.set_allocator(rmm_cupy_allocator)
+
+    import cudf  # noqa
+    import cugraph_pyg  # noqa
+    cudf.set_option("spill", True)
+
 import torch.nn.functional as F  # noqa
 from sklearn.metrics import confusion_matrix, precision_score, recall_score, f1_score
 import matplotlib.pyplot as plt
-# Enable cudf spilling to save gpu memory
-#from cugraph_pyg.loader import NeighborLoader  # noqa
-# Import OGB node property prediction dataset for standard benchmarks
 from ogb.nodeproppred import PygNodePropPredDataset  # noqa
 
 
 import torch_geometric  # noqa
-
-cudf.set_option("spill", True)
 
 
 class IDSWindowedDataset:
@@ -159,15 +152,13 @@ def safe_get_world_size():
 
 def init_distributed():
     """Initialize distributed training if environment variables are set.
-    Fallback to single-GPU mode otherwise.
+    Fallback to single-process mode otherwise.
 
     Returns the device_id to use for barrier() calls.
     """
-    # Already initialized ? nothing to do
     if dist.is_available() and dist.is_initialized():
         return 0
 
-    # Default env vars for single-GPU / single-process fallback
     default_env = {
         "RANK": "0",
         "LOCAL_RANK": "0",
@@ -177,27 +168,26 @@ def init_distributed():
         "MASTER_PORT": "29500"
     }
 
-    # Update environment only if keys are missing
     for k, v in default_env.items():
         os.environ.setdefault(k, v)
 
-    # Set CUDA device and capture device_id
     device_id = 0
     if torch.cuda.is_available():
         device_id = int(os.environ.get("LOCAL_RANK", "0"))
         torch.cuda.set_device(device_id)
 
-    # Initialize distributed only if world_size > 1
     world_size = int(os.environ["WORLD_SIZE"])
     if world_size > 1:
-        dist.init_process_group(backend="nccl", init_method="env://", device_id=device_id)
+        backend = "nccl" if torch.cuda.is_available() else "gloo"
+        dist.init_process_group(backend=backend, init_method="env://", device_id=device_id)
         rank = os.environ['RANK']
-        print(f"Initialized distributed: rank {rank}, world_size {world_size}")
+        print(f"Initialized distributed: rank {rank}, world_size {world_size}, backend={backend}")
     else:
-        print("Running in single-GPU / single-process mode")
+        print("Running in single-process mode (CPU)" if not torch.cuda.is_available() else "Running in single-GPU / single-process mode")
 
     if not dist.is_initialized():
-        dist.init_process_group(backend="nccl", init_method="env://", rank=0,
+        backend = "nccl" if torch.cuda.is_available() else "gloo"
+        dist.init_process_group(backend=backend, init_method="env://", rank=0,
                                 world_size=1, device_id=device_id)
 
     return device_id
@@ -308,10 +298,9 @@ def train(model, train_loader, optimizer, is_custom_dataset=False):
     total_examples = 0
     for batch in train_loader:
         if is_custom_dataset:
-            # Custom IDS dataset format
-            x = batch.x.cuda()
-            y = batch.y.cuda()
-            edge_index = batch.edge_index.cuda()
+            x = batch.x.to(DEVICE)
+            y = batch.y.to(DEVICE)
+            edge_index = batch.edge_index.to(DEVICE)
             optimizer.zero_grad()
             out = model(x, edge_index)
             loss = F.cross_entropy(out, y.view(-1))
@@ -323,8 +312,7 @@ def train(model, train_loader, optimizer, is_custom_dataset=False):
             total_correct += out.argmax(dim=-1).eq(y.view(-1)).sum().item()
             total_examples += batch_sz
         else:
-            # OGB/cugraph_pyg format
-            batch = batch.cuda()
+            batch = batch.to(DEVICE)
             optimizer.zero_grad()
             out = model(batch.x, batch.edge_index)[: batch.batch_size]
             y = batch.y[: batch.batch_size].view(-1).to(torch.long)
@@ -349,24 +337,21 @@ def test(model, loader, is_custom_dataset=False):
     total_correct = total_examples = 0
     for batch in loader:
         if is_custom_dataset:
-            # Custom IDS dataset format
-            batch_x = batch.x.cuda()
-            batch_y = batch.y.cuda()
-            batch_edge_index = batch.edge_index.cuda()
+            batch_x = batch.x.to(DEVICE)
+            batch_y = batch.y.to(DEVICE)
+            batch_edge_index = batch.edge_index.to(DEVICE)
             
             out = model(batch_x, batch_edge_index)
             total_correct += out.argmax(dim=-1).eq(batch_y.view(-1)).sum().item()
             total_examples += batch_y.size(0)
         else:
-            # OGB/cugraph_pyg format
-            batch = batch.cuda()
+            batch = batch.to(DEVICE)
             out = model(batch.x, batch.edge_index)[:batch.batch_size]
             y = batch.y[:batch.batch_size].view(-1).to(torch.long)
 
             total_correct += out.argmax(dim=-1).eq(y).sum()
             total_examples += y.size(0)
 
-    #return total_correct.item() / total_examples
     return total_correct / total_examples
 
 # ---------------------------------------------------------------------
@@ -383,14 +368,14 @@ def _gather_predictions(model, loader, is_custom_dataset=False):
     all_labels = []
     for batch in loader:
         if is_custom_dataset:
-            x = batch.x.cuda()
-            y = batch.y.cuda()
-            edge_index = batch.edge_index.cuda()
+            x = batch.x.to(DEVICE)
+            y = batch.y.to(DEVICE)
+            edge_index = batch.edge_index.to(DEVICE)
             out = model(x, edge_index)
             preds = out.argmax(dim=-1).cpu().numpy()
             labels = y.view(-1).cpu().numpy()
         else:
-            batch = batch.cuda()
+            batch = batch.to(DEVICE)
             out = model(batch.x, batch.edge_index)[: batch.batch_size]
             y = batch.y[: batch.batch_size].view(-1).to(torch.long)
             preds = out.argmax(dim=-1).cpu().numpy()
@@ -456,7 +441,7 @@ if __name__ == '__main__':
             dataset_root = dataset_root / 'graph_unsw_full_10min'
         elif args.dataset == 'ids-custom':
             # Default path for ids-custom as requested
-            custom_path = dataset_root / 'graph_10min_moduleA'
+            custom_path = dataset_root / 'graph_10min_moduleA_stratified'
             if custom_path.exists():
                 dataset_root = custom_path
             else:
@@ -500,7 +485,6 @@ if __name__ == '__main__':
         datasets = {'train': train_dataset, 'val': val_dataset, 'test': test_dataset}
         
     else:
-        # Original OGB dataset loading
         root = osp.join(args.dataset_dir, args.dataset_subdir)
 
         if safe_get_rank() == 0:
@@ -523,20 +507,20 @@ if __name__ == '__main__':
             data.edge_index, _ = torch_geometric.utils.add_self_loops(
                 data.edge_index, num_nodes=data.num_nodes)
         
-        # Setup cugraph_pyg stores for OGB datasets
-        graph_store = cugraph_pyg.data.GraphStore()
-        graph_store[dict(
-            edge_type=('node', 'rel', 'node'),
-            layout='coo',
-            is_sorted=False,
-            size=(data.num_nodes, data.num_nodes),
-        )] = data.edge_index
+        if torch.cuda.is_available():
+            graph_store = cugraph_pyg.data.GraphStore()
+            graph_store[dict(
+                edge_type=('node', 'rel', 'node'),
+                layout='coo',
+                is_sorted=False,
+                size=(data.num_nodes, data.num_nodes),
+            )] = data.edge_index
 
-        feature_store = cugraph_pyg.data.FeatureStore()
-        feature_store['node', 'x', None] = data.x
-        feature_store['node', 'y', None] = data.y
+            feature_store = cugraph_pyg.data.FeatureStore()
+            feature_store['node', 'x', None] = data.x
+            feature_store['node', 'y', None] = data.y
 
-        data = (feature_store, graph_store)
+            data = (feature_store, graph_store)
         datasets = None
 
     if safe_get_rank() == 0:
@@ -555,18 +539,17 @@ if __name__ == '__main__':
                                               args.hidden_channels,
                                               args.num_layers,
                                               num_classes,
-                                              heads=args.num_heads).cuda()
+                                              heads=args.num_heads).to(DEVICE)
     elif args.model == "GCN":
         model = torch_geometric.nn.models.GCN(num_features,
                                               args.hidden_channels,
                                               args.num_layers,
-                                              num_classes).cuda()
+                                              num_classes).to(DEVICE)
     elif args.model == "SAGE":
         model = torch_geometric.nn.models.GraphSAGE(
             num_features, args.hidden_channels, args.num_layers,
-            num_classes).cuda()
+            num_classes).to(DEVICE)
     elif args.model == 'SGFormer':
-        # TODO add support for this with disjoint sampling
         model = torch_geometric.nn.models.SGFormer(
             in_channels=num_features,
             hidden_channels=args.hidden_channels,
@@ -575,7 +558,7 @@ if __name__ == '__main__':
             trans_dropout=args.dropout,
             gnn_num_layers=args.num_layers,
             gnn_dropout=args.dropout,
-        ).cuda()
+        ).to(DEVICE)
     else:
         raise ValueError(f'Unsupported model type: {args.model}')
 
@@ -615,20 +598,20 @@ if __name__ == '__main__':
         )
         
     else:
-        # Original OGB dataset loading with cugraph_pyg
-        graph_store = cugraph_pyg.data.GraphStore()
-        graph_store[dict(
-            edge_type=('node', 'rel', 'node'),
-            layout='coo',
-            is_sorted=False,
-            size=(data.num_nodes, data.num_nodes),
-        )] = data.edge_index
+        if torch.cuda.is_available():
+            graph_store = cugraph_pyg.data.GraphStore()
+            graph_store[dict(
+                edge_type=('node', 'rel', 'node'),
+                layout='coo',
+                is_sorted=False,
+                size=(data.num_nodes, data.num_nodes),
+            )] = data.edge_index
 
-        feature_store = cugraph_pyg.data.FeatureStore()
-        feature_store['node', 'x', None] = data.x
-        feature_store['node', 'y', None] = data.y
+            feature_store = cugraph_pyg.data.FeatureStore()
+            feature_store['node', 'x', None] = data.x
+            feature_store['node', 'y', None] = data.y
 
-        data = (feature_store, graph_store)
+            data = (feature_store, graph_store)
 
         loader_kwargs = dict(
             data=data,
@@ -684,66 +667,51 @@ if __name__ == '__main__':
         print(f"Best validation accuracy: {best_val:.4f}")
         print("Testing...")
         final_test_acc = test(model, test_loader, is_custom_dataset=is_custom_dataset)
-        print(f'Test Accuracy: {final_test_acc:.4f}')
-        # -----------------------------------------------------------------
-        # Confusion matrix for the test set (saved as ``confusion_matrix.png``)
-        # -----------------------------------------------------------------
-        if safe_get_rank() == 0:
-            preds, labels = _gather_predictions(model, test_loader,
+        preds, labels = _gather_predictions(model, test_loader,
                                             is_custom_dataset=is_custom_dataset)
-            cm = confusion_matrix(labels, preds)
-            precision = precision_score(labels, preds, average='binary')
-            recall = recall_score(labels, preds, average='binary')
-            f1 = f1_score(labels, preds, average='binary')
+        cm = confusion_matrix(labels, preds)
+        precision = precision_score(labels, preds, average='binary')
+        recall = recall_score(labels, preds, average='binary')
+        f1 = f1_score(labels, preds, average='binary')
 
-            class_names = ['Benign', 'Malicious'] if args.dataset in ['ids-custom', 'ids-unsw-full'] else [str(i) for i in range(cm.shape[0])]
-            
-            # Save confusion matrix with dataset- and epoch-specific filename
-            cm_filename = f"confusion_matrix_{args.dataset}_{args.epochs}epochs.png"
-            _plot_confusion(cm, class_names, save_path=cm_filename)
+        class_names = ['Benign', 'Malicious'] if args.dataset in ['ids-custom', 'ids-unsw-full'] else [str(i) for i in range(cm.shape[0])]
+        
+        cm_filename = f"confusion_matrix_{args.dataset}_{args.epochs}epochs.png"
+        _plot_confusion(cm, class_names, save_path=cm_filename)
 
-            # Calculate test accuracy
-            test_acc = (preds == labels).mean()
+        test_acc = (preds == labels).mean()
 
-            # Format metrics for reporting
-            metrics_report = (
-                f"Dataset: {args.dataset}\n"
-                f"Model: {args.model}\n"
-                f"Epochs: {args.epochs}\n"
-                f"----------------------------\n"
-                f"Test Accuracy: {test_acc:.4f}\n"
-                f"Test Precision: {precision:.4f}\n"
-                f"Test Recall: {recall:.4f}\n"
-                f"Test F1 Score: {f1:.4f}\n"
-            )
+        metrics_report = (
+            f"Dataset: {args.dataset}\n"
+            f"Model: {args.model}\n"
+            f"Epochs: {args.epochs}\n"
+            f"----------------------------\n"
+            f"Test Accuracy: {test_acc:.4f}\n"
+            f"Test Precision: {precision:.4f}\n"
+            f"Test Recall: {recall:.4f}\n"
+            f"Test F1 Score: {f1:.4f}\n"
+        )
 
-            print(metrics_report)
-            
-            # Save metrics to a text file
-            metrics_filename = f"metrics_{args.dataset}_{args.epochs}epochs.txt"
-            with open(metrics_filename, "w") as f:
-                f.write(metrics_report)
-            print(f"Metrics report saved to {metrics_filename}")
+        print(metrics_report)
+        
+        metrics_filename = f"metrics_{args.dataset}_{args.epochs}epochs.txt"
+        with open(metrics_filename, "w") as f:
+            f.write(metrics_report)
 
-            # Save per-window predictions and labels for downstream analysis
-            preds_dir = Path(f"predictions_{args.dataset}")
-            preds_dir.mkdir(exist_ok=True)
-            
-            test_graphs_dir = test_dataset.graphs_dir
-            test_graph_files = sorted(test_graphs_dir.glob("*.npz"))
-            node_offset = 0
-            for w, graph_file in enumerate(test_graph_files):
-                data_win = np.load(graph_file)
-                num_nodes_win = data_win['node_features'].shape[0]
-                win_preds = preds[node_offset:node_offset + num_nodes_win]
-                win_labels = labels[node_offset:node_offset + num_nodes_win]
-                np.save(preds_dir / f"window_{w:05d}_preds.npy", win_preds)
-                np.save(preds_dir / f"window_{w:05d}_labels.npy", win_labels)
-                node_offset += num_nodes_win
-            
-            print(f"Confusion matrix saved to {cm_filename}")
-            print(f"Metrics saved to {metrics_filename}")
-            print(f"Per-window predictions saved to {preds_dir}/")
+        preds_dir = Path(f"predictions_{args.dataset}")
+        preds_dir.mkdir(exist_ok=True)
+        
+        test_graphs_dir = test_dataset.graphs_dir
+        test_graph_files = sorted(test_graphs_dir.glob("*.npz"))
+        node_offset = 0
+        for w, graph_file in enumerate(test_graph_files):
+            data_win = np.load(graph_file)
+            num_nodes_win = data_win['node_features'].shape[0]
+            win_preds = preds[node_offset:node_offset + num_nodes_win]
+            win_labels = labels[node_offset:node_offset + num_nodes_win]
+            np.save(preds_dir / f"window_{w:05d}_preds.npy", win_preds)
+            np.save(preds_dir / f"window_{w:05d}_labels.npy", win_labels)
+            node_offset += num_nodes_win
         total_time = round(time.perf_counter() - wall_clock_start, 2)
         print("Total Program Runtime (total_time) =", total_time, "seconds")
 
